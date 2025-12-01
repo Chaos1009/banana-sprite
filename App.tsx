@@ -3,6 +3,7 @@ import Header from './components/Header';
 import ImageUploader from './components/ImageUploader';
 import PromptInput from './components/PromptInput';
 import SpriteDisplay from './components/SpriteDisplay';
+import ApiKeyDialog from './components/ApiKeyDialog';
 import { generateSprite } from './services/geminiService';
 import { GenerationStatus, Language } from './types';
 import { TRANSLATIONS } from './constants';
@@ -15,6 +16,8 @@ function App() {
   const [spriteResult, setSpriteResult] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [language, setLanguage] = useState<Language>('ja');
+  const [showApiKeyDialog, setShowApiKeyDialog] = useState<boolean>(false);
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
 
   // Initialize API Key (Pro Model requires user selection)
   useEffect(() => {
@@ -37,10 +40,14 @@ function App() {
                  setApiKey(storedKey);
              } else if(process.env.API_KEY) {
                  setApiKey(process.env.API_KEY);
+             } else {
+                 // No API key found, show dialog
+                 setShowApiKeyDialog(true);
              }
         }
       } catch (e) {
         console.error("Error initializing API key:", e);
+        setShowApiKeyDialog(true);
       }
     };
     initKey();
@@ -53,22 +60,35 @@ function App() {
             setApiKey(process.env.API_KEY || '');
              // window.location.reload(); // Reload isn't strictly necessary if state updates, but good for clean slate
         } else {
-            // Manual input for non-AI Studio environments
-            const key = window.prompt(language === 'ja' ? "Gemini APIキーを入力してください" : "Please enter your Gemini API Key", apiKey);
-            if (key) {
-                setApiKey(key);
-                localStorage.setItem('banana_sprite_api_key', key);
-            }
+            // Show dialog for non-AI Studio environments
+            setApiKeyError(null);
+            setShowApiKeyDialog(true);
         }
     } catch(e) {
         console.error("Failed to open key selector", e);
+        setShowApiKeyDialog(true);
     }
+  };
+
+  const handleSaveApiKey = (key: string) => {
+    if (key.trim()) {
+      setApiKey(key.trim());
+      localStorage.setItem('banana_sprite_api_key', key.trim());
+      setShowApiKeyDialog(false);
+      setApiKeyError(null);
+    }
+  };
+
+  const handleCloseApiKeyDialog = () => {
+    setShowApiKeyDialog(false);
+    setApiKeyError(null);
   };
 
   const handleGenerate = async () => {
     if (!apiKey) {
       setErrorMsg(language === 'ja' ? "APIキーを選択してください。" : "Please select an API Key first.");
-      await handleSelectKey();
+      setApiKeyError(null);
+      setShowApiKeyDialog(true);
       return;
     }
     if (!referenceImage) {
@@ -93,9 +113,18 @@ function App() {
     } catch (err: any) {
       console.error(err);
       setStatus(GenerationStatus.ERROR);
-      if (err.message && err.message.includes("Requested entity was not found")) {
-         setErrorMsg(language === 'ja' ? "APIキーが無効か、プロジェクトが見つかりません。" : "API Key invalid or project not found. Please select a valid key.");
-         await handleSelectKey();
+      const errorMessage = err.message || '';
+      if (errorMessage.includes("Requested entity was not found") || 
+          errorMessage.includes("API key") || 
+          errorMessage.includes("invalid") ||
+          errorMessage.includes("unauthorized") ||
+          errorMessage.includes("permission")) {
+         const msg = language === 'ja' 
+           ? "APIキーが無効か、プロジェクトが見つかりません。正しいAPIキーを入力してください。" 
+           : "API Key invalid or project not found. Please enter a valid API key.";
+         setErrorMsg(msg);
+         setApiKeyError(msg);
+         setShowApiKeyDialog(true);
       } else {
          setErrorMsg(err.message || (language === 'ja' ? "生成に失敗しました。" : "Failed to generate sprite sheet. Please try again."));
       }
@@ -106,6 +135,13 @@ function App() {
 
   return (
     <div className="min-h-screen flex flex-col font-sans text-gray-900 bg-yellow-50/30">
+      <ApiKeyDialog
+        isOpen={showApiKeyDialog}
+        onClose={handleCloseApiKeyDialog}
+        onSave={handleSaveApiKey}
+        language={language}
+        errorMessage={apiKeyError || undefined}
+      />
       <Header language={language} setLanguage={setLanguage} onApiKeyClick={handleSelectKey} />
 
       <main className="flex-grow max-w-5xl mx-auto w-full px-4 py-8">
