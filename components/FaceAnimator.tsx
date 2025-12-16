@@ -1,8 +1,8 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { useAudioMouthSync } from '../src/hooks/useAudioMouthSync';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useBlinkScheduler } from '../src/hooks/useBlinkScheduler';
-import { extractExpressionParts, drawFaceGuides, DEFAULT_FACE_PARTS } from '../src/faceParts';
-import { FacePartImages, RecordingState } from '../types';
+import { analyzeAudioBuffer } from '../src/utils/audioAnalysis';
+import { SpriteSheetAnalysis } from '../services/geminiService';
+import { ExpressionFrameSelection, MouthState } from '../types';
 
 export interface FaceAnimatorProps {
   frames: string[]; // Base64 data URLs
@@ -11,12 +11,12 @@ export interface FaceAnimatorProps {
   audioSource?: AudioBuffer | MediaStream | null;
   debugGuides?: boolean;
   volumeThreshold?: number;
-  onRecordingStateChange?: (state: RecordingState) => void;
-  onRecordingControlsReady?: (controls: {
-    startRecording: () => void;
-    stopRecording: () => void;
-    getRecordedBlob: () => Blob | null;
-  }) => void;
+  mouthMidThreshold?: number;
+  mouthOpenThreshold?: number;
+  spriteAnalysis?: SpriteSheetAnalysis | null; // Gemini APIによる分析結果
+  selectedFrames: ExpressionFrameSelection | null; // ユーザーが選択したフレーム
+  regenerateKey?: number;
+  onVideoGenerated?: (videoUrl: string) => void;
 }
 
 export const FaceAnimator: React.FC<FaceAnimatorProps> = ({
@@ -26,309 +26,235 @@ export const FaceAnimator: React.FC<FaceAnimatorProps> = ({
   audioSource = null,
   debugGuides = false,
   volumeThreshold = 0.01,
-  onRecordingStateChange,
-  onRecordingControlsReady,
+  mouthMidThreshold,
+  mouthOpenThreshold,
+  spriteAnalysis = null,
+  selectedFrames = null,
+  regenerateKey = 0,
+  onVideoGenerated,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
-  const [faceParts, setFaceParts] = useState<FacePartImages | null>(null);
-  const [isInitialized, setIsInitialized] = useState(false);
   const animationFrameRef = useRef<number | null>(null);
-  const [recordingState, setRecordingState] = useState<RecordingState>('idle');
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const isRenderingRef = useRef<boolean>(false);
+  const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
+  const videoGenerationRef = useRef<boolean>(false);
+  const lastRegenerateKeyRef = useRef<number>(regenerateKey);
+  const [currentMouthState, setCurrentMouthState] = useState<MouthState>('closed');
+  const mouthStateRef = useRef<MouthState>('closed');
 
-  const { mouthState } = useAudioMouthSync({ audioSource, threshold: volumeThreshold });
   const { eyeState } = useBlinkScheduler();
 
-  // Initialize face parts extraction - find best frames for each expression
-  useEffect(() => {
-    if (frames.length === 0) return;
-
-    const extractParts = async () => {
-      try {
-        const parts = await extractExpressionParts(frames, width, height);
-        setFaceParts(parts);
-        
-        // Preload all images to prevent flickering
-        const imageUrls = [
-          frames[0], // base frame
-          parts.eyesOpen,
-          parts.eyesClosed,
-          parts.mouthOpen,
-          parts.mouthClosed,
-        ];
-        
-        await Promise.all(
-          imageUrls.map((url) => {
-            return new Promise<void>((resolve) => {
-              if (imageCacheRef.current.has(url)) {
-                resolve();
-                return;
-              }
-              const img = new Image();
-              img.onload = () => {
-                imageCacheRef.current.set(url, img);
-                resolve();
-              };
-              img.onerror = () => resolve(); // Continue even if image fails
-              img.src = url;
-            });
-          })
-        );
-        
-        setIsInitialized(true);
-      } catch (err) {
-        console.error('Failed to extract expression parts:', err);
-      }
+  const resolvedSelection = useMemo<ExpressionFrameSelection>(() => {
+    if (selectedFrames) return selectedFrames;
+    const eyesOpen = spriteAnalysis?.recommendedEyesOpenFrame ?? 0;
+    const eyesClosed = spriteAnalysis?.recommendedEyesClosedFrame ?? 0;
+    const mouthOpen = spriteAnalysis?.recommendedMouthOpenFrame ?? 0;
+    const mouthClosed = spriteAnalysis?.recommendedMouthClosedFrame ?? 0;
+    const mouthMid = mouthOpen;
+    return {
+      eyesOpenMouthOpen: eyesOpen,
+      eyesOpenMouthMid: mouthMid,
+      eyesOpenMouthClosed: eyesOpen,
+      eyesClosedMouthOpen: eyesClosed,
+      eyesClosedMouthMid: mouthMid,
+      eyesClosedMouthClosed: eyesClosed || mouthClosed,
     };
+  }, [selectedFrames, spriteAnalysis]);
 
-    extractParts();
-  }, [frames, width, height]);
+  const resolveFrameIndex = useCallback(
+    (eye: 'open' | 'closed', mouth: MouthState) => {
+      const key =
+        eye === 'open'
+          ? mouth === 'open'
+            ? 'eyesOpenMouthOpen'
+            : mouth === 'mid'
+            ? 'eyesOpenMouthMid'
+            : 'eyesOpenMouthClosed'
+          : mouth === 'open'
+          ? 'eyesClosedMouthOpen'
+          : mouth === 'mid'
+          ? 'eyesClosedMouthMid'
+          : 'eyesClosedMouthClosed';
 
-  // Render composite frame
-  // Use frame 0 as base for body, and only change eyes/mouth based on state
-  const renderCompositeFrame = useCallback(() => {
+      return resolvedSelection[key] ?? 0;
+    },
+    [resolvedSelection]
+  );
+
+  const renderFrame = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !isInitialized || !faceParts || isRenderingRef.current) return;
+    if (!canvas || frames.length === 0) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    isRenderingRef.current = true;
+    const frameIdx = resolveFrameIndex(eyeState, currentMouthState);
+    const frameSrc = frames[frameIdx] || frames[0];
 
-    // Get cached images or load them
-    const getCachedImage = (url: string): Promise<HTMLImageElement> => {
-      return new Promise((resolve) => {
-        const cached = imageCacheRef.current.get(url);
-        if (cached) {
-          resolve(cached);
-          return;
-        }
-        const img = new Image();
-        img.onload = () => {
-          imageCacheRef.current.set(url, img);
-          resolve(img);
-        };
-        img.onerror = () => {
-          // Create a blank image if loading fails
-          const blank = new Image();
-          imageCacheRef.current.set(url, blank);
-          resolve(blank);
-        };
-        img.src = url;
-      });
-    };
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-    // Render synchronously using cached images
-    (async () => {
-      try {
-        const baseImg = await getCachedImage(frames[0]);
-        const eyePartUrl = eyeState === 'open' ? faceParts.eyesOpen : faceParts.eyesClosed;
-        const mouthPartUrl = mouthState === 'open' ? faceParts.mouthOpen : faceParts.mouthClosed;
-        
-        const eyeImg = await getCachedImage(eyePartUrl);
-        const mouthImg = await getCachedImage(mouthPartUrl);
-
-        // Clear canvas
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        // Draw base frame
-        ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
-
-        // Draw eyes at the correct position
-        const eyeRect = eyeState === 'open' ? DEFAULT_FACE_PARTS.eyesOpen : DEFAULT_FACE_PARTS.eyesClosed;
-        const eyeX = Math.floor(eyeRect.x * canvas.width);
-        const eyeY = Math.floor(eyeRect.y * canvas.height);
-        const eyeW = Math.floor(eyeRect.w * canvas.width);
-        const eyeH = Math.floor(eyeRect.h * canvas.height);
-        ctx.drawImage(eyeImg, eyeX, eyeY, eyeW, eyeH);
-
-        // Draw mouth at the correct position
-        const mouthRect = mouthState === 'open' ? DEFAULT_FACE_PARTS.mouthOpen : DEFAULT_FACE_PARTS.mouthClosed;
-        const mouthX = Math.floor(mouthRect.x * canvas.width);
-        const mouthY = Math.floor(mouthRect.y * canvas.height);
-        const mouthW = Math.floor(mouthRect.w * canvas.width);
-        const mouthH = Math.floor(mouthRect.h * canvas.height);
-        ctx.drawImage(mouthImg, mouthX, mouthY, mouthW, mouthH);
-
-        // Draw debug guides if enabled
-        if (debugGuides) {
-          drawFaceGuides(ctx, DEFAULT_FACE_PARTS, canvas.width);
-        }
-      } catch (err) {
-        console.error('Error rendering frame:', err);
-      } finally {
-        isRenderingRef.current = false;
+      if (debugGuides) {
+        ctx.strokeStyle = '#00FF00';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(0, 0, canvas.width, canvas.height);
       }
-    })();
-  }, [frames, faceParts, eyeState, mouthState, debugGuides, isInitialized]);
-
-  // Animation loop (10fps)
-  // For expression sprites, we use frame 0 as base and only change eyes/mouth
-  useEffect(() => {
-    if (!isInitialized || frames.length === 0) return;
-
-    const animate = () => {
-      // Always use frame 0 as base for body, only eyes/mouth change based on state
-      renderCompositeFrame();
-      // Update frame index for display purposes (shows which frame we're using as base)
-      setCurrentFrameIndex(0);
-      animationFrameRef.current = window.setTimeout(animate, 100); // 10fps
     };
+    img.onerror = () => {
+      console.error('[FaceAnimator] 画像読み込みエラー', { frameIdx });
+    };
+    img.src = frameSrc;
+  }, [frames, resolveFrameIndex, eyeState, currentMouthState, debugGuides]);
 
-    // Initial render
-    renderCompositeFrame();
+  // Preview loop (10fps)
+  useEffect(() => {
+    if (frames.length === 0) return;
+    const animate = () => {
+      renderFrame();
+      setCurrentFrameIndex((prev) => (prev + 1) % Math.max(frames.length, 1));
+      animationFrameRef.current = window.setTimeout(animate, 100);
+    };
     animate();
-
     return () => {
       if (animationFrameRef.current) {
         clearTimeout(animationFrameRef.current);
       }
     };
-  }, [isInitialized, frames, renderCompositeFrame]);
+  }, [frames, renderFrame]);
 
-  // Re-render when eye or mouth state changes
+  // 動画生成（AudioBuffer がある場合のみ自動で生成）
   useEffect(() => {
-    if (isInitialized && frames.length > 0) {
-      renderCompositeFrame();
-    }
-  }, [eyeState, mouthState, isInitialized, frames, renderCompositeFrame]);
-
-  // Recording functionality
-  const startRecording = useCallback(async () => {
     const canvas = canvasRef.current;
-    if (!canvas || recordingState !== 'idle') return;
+    if (!canvas || !audioSource || !(audioSource instanceof AudioBuffer)) return;
+    if (videoGenerationRef.current) return;
+    // すでに生成済みで、トリガーが変わっていない場合はスキップ
+    if (generatedVideoUrl && lastRegenerateKeyRef.current === regenerateKey) return;
+    lastRegenerateKeyRef.current = regenerateKey;
 
-    try {
-      // Capture stream from canvas
-      const stream = canvas.captureStream(10); // 10fps
-      streamRef.current = stream;
+    const classifyMouth = (volume: number): MouthState => {
+      const midThreshold = mouthMidThreshold ?? Math.max(volumeThreshold * 1.5, volumeThreshold + 0.005);
+      const openThreshold = mouthOpenThreshold ?? Math.max(volumeThreshold * 3, volumeThreshold + 0.01);
+      if (volume >= openThreshold) return 'open';
+      if (volume >= midThreshold) return 'mid';
+      return 'closed';
+    };
 
-      // Add audio track if available
-      if (audioSource instanceof MediaStream) {
-        // Microphone input
-        const audioTracks = audioSource.getAudioTracks();
-        audioTracks.forEach((track) => {
-          stream.addTrack(track);
-        });
-      } else if (audioSource instanceof AudioBuffer) {
-        // File upload - create audio track from AudioBuffer
+    const smoothTransition = (prev: MouthState, target: MouthState): MouthState => {
+      if (prev === 'closed' && target === 'open') return 'mid';
+      if (prev === 'open' && target === 'closed') return 'mid';
+      if (prev === 'mid' && target === 'open') return 'open';
+      if (prev === 'mid' && target === 'closed') return 'closed';
+      return target;
+    };
+
+    const generateVideo = async () => {
+      videoGenerationRef.current = true;
+      console.log('[FaceAnimator] 動画生成開始（フレーム切替版）', {
+        audioDuration: audioSource.duration.toFixed(2) + 's',
+      });
+
+      try {
+        const fps = 10;
+        const frameInterval = 1000 / fps;
+        const volumeFrames = analyzeAudioBuffer(audioSource, fps, volumeThreshold, 0.1);
+
+        // capture canvas
+        const stream = canvas.captureStream(fps);
         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
         const source = audioContext.createBufferSource();
         source.buffer = audioSource;
-        
         const destination = audioContext.createMediaStreamDestination();
         source.connect(destination);
-        source.start();
-        
-        // Add audio track to stream
-        const audioTracks = destination.stream.getAudioTracks();
-        audioTracks.forEach((track) => {
-          stream.addTrack(track);
+        destination.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
+
+        const options: MediaRecorderOptions = {
+          mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+            ? 'video/webm;codecs=vp9'
+            : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+            ? 'video/webm;codecs=vp8'
+            : 'video/webm',
+          videoBitsPerSecond: 2500000,
+        };
+
+        const mediaRecorder = new MediaRecorder(stream, options);
+        const recordedChunks: Blob[] = [];
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) recordedChunks.push(event.data);
+        };
+
+        const recordingPromise = new Promise<void>((resolve) => {
+          mediaRecorder.onstop = () => {
+            const blob = new Blob(recordedChunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            setGeneratedVideoUrl(url);
+            videoGenerationRef.current = false;
+            if (onVideoGenerated) onVideoGenerated(url);
+            resolve();
+          };
         });
-      }
 
-      // Create MediaRecorder
-      const options: MediaRecorderOptions = {
-        mimeType: 'video/webm;codecs=vp9',
-        videoBitsPerSecond: 2500000,
-      };
+        source.start(0);
+        mediaRecorder.start();
 
-      // Fallback to vp8 if vp9 not supported
-      if (!MediaRecorder.isTypeSupported(options.mimeType!)) {
-        options.mimeType = 'video/webm;codecs=vp8';
-      }
+        const startTime = Date.now();
+        let frameIndex = 0;
 
-      // Fallback to default if vp8 not supported
-      if (!MediaRecorder.isTypeSupported(options.mimeType!)) {
-        options.mimeType = 'video/webm';
-      }
-
-      const mediaRecorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-      recordedChunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-        setRecordingState('saving');
-        if (onRecordingStateChange) {
-          onRecordingStateChange('saving');
-        }
-        // The blob URL will be handled by parent component
-        setTimeout(() => {
-          setRecordingState('idle');
-          if (onRecordingStateChange) {
-            onRecordingStateChange('idle');
+        const updateFrame = () => {
+          if (frameIndex >= volumeFrames.length) {
+            setTimeout(() => {
+              mediaRecorder.stop();
+              source.stop();
+              stream.getTracks().forEach((track) => track.stop());
+              audioContext.close();
+            }, 200);
+            return;
           }
-        }, 100);
-      };
 
-      mediaRecorder.start();
-      setRecordingState('recording');
-      if (onRecordingStateChange) {
-        onRecordingStateChange('recording');
-      }
-    } catch (err) {
-      console.error('Failed to start recording:', err);
-      setRecordingState('idle');
-      if (onRecordingStateChange) {
-        onRecordingStateChange('idle');
-      }
-    }
-  }, [recordingState, audioSource, onRecordingStateChange]);
+          const elapsed = (Date.now() - startTime) / 1000;
+          const currentFrame = volumeFrames[frameIndex];
+          if (elapsed >= currentFrame.time) {
+            const target = classifyMouth(currentFrame.volume);
+            const nextMouth = smoothTransition(mouthStateRef.current, target);
+            mouthStateRef.current = nextMouth;
+            setCurrentMouthState(nextMouth);
+            renderFrame();
+            frameIndex++;
+          }
 
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && recordingState === 'recording') {
-      mediaRecorderRef.current.stop();
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
-    }
-  }, [recordingState]);
+          if (frameIndex < volumeFrames.length) {
+            const nextFrameTime = volumeFrames[frameIndex].time;
+            const waitTime = Math.max(0, (nextFrameTime - elapsed) * 1000);
+            setTimeout(updateFrame, Math.min(waitTime, frameInterval));
+          } else {
+            setTimeout(updateFrame, frameInterval);
+          }
+        };
 
-  // Store recording controls for parent access
-  const recordingControlsRef = useRef({
-    startRecording,
-    stopRecording,
-    getRecordedBlob: () => {
-      if (recordedChunksRef.current.length > 0) {
-        return new Blob(recordedChunksRef.current, { type: 'video/webm' });
-      }
-      return null;
-    },
-  });
-
-  useEffect(() => {
-    const controls = {
-      startRecording,
-      stopRecording,
-      getRecordedBlob: () => {
-        if (recordedChunksRef.current.length > 0) {
-          return new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        if (volumeFrames.length > 0) {
+          const initial = classifyMouth(volumeFrames[0].volume);
+          mouthStateRef.current = initial;
+          setCurrentMouthState(initial);
+          renderFrame();
         }
-        return null;
-      },
-    };
-    recordingControlsRef.current = controls;
-    if (onRecordingControlsReady) {
-      onRecordingControlsReady(controls);
-    }
-  }, [startRecording, stopRecording, onRecordingControlsReady]);
 
-  if (!isInitialized) {
+        setTimeout(updateFrame, 50);
+        await recordingPromise;
+      } catch (err) {
+        console.error('[FaceAnimator] 動画生成エラー:', err);
+        videoGenerationRef.current = false;
+      }
+    };
+
+    const timer = setTimeout(() => generateVideo(), 500);
+    return () => clearTimeout(timer);
+  }, [audioSource, generatedVideoUrl, onVideoGenerated, volumeThreshold, mouthMidThreshold, mouthOpenThreshold, renderFrame, regenerateKey]);
+
+  if (frames.length === 0) {
     return (
       <div className="flex items-center justify-center w-full h-full">
-        <div className="text-gray-500">Initializing face parts...</div>
+        <div className="text-gray-500">No frames</div>
       </div>
     );
   }
@@ -343,7 +269,7 @@ export const FaceAnimator: React.FC<FaceAnimatorProps> = ({
         style={{ maxWidth: '100%', height: 'auto' }}
       />
       <div className="mt-2 text-xs text-gray-500">
-        Frame: {currentFrameIndex + 1}/{frames.length} | Eyes: {eyeState} | Mouth: {mouthState}
+        Frame: {currentFrameIndex + 1}/{frames.length} | Eyes: {eyeState} | Mouth: {currentMouthState}
       </div>
     </div>
   );

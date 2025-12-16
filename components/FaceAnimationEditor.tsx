@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { sliceSpriteSheet } from '../services/imageUtils';
-import { Language, RecordingState, GenerationStatus } from '../types';
+import { Language, GenerationStatus, ExpressionFrameSelection } from '../types';
 import { TRANSLATIONS, EXPRESSION_PRESETS } from '../constants';
 import { FaceAnimator } from './FaceAnimator';
-import { generateSprite } from '../services/geminiService';
+import { FaceFrameSelector } from './FaceFrameSelector';
+import { generateSprite, analyzeSpriteSheet, SpriteSheetAnalysis } from '../services/geminiService';
 
 interface FaceAnimationEditorProps {
   language: Language;
@@ -15,25 +16,22 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
   const [frameWidth, setFrameWidth] = useState(256);
   const [frameHeight, setFrameHeight] = useState(256);
   const [audioSource, setAudioSource] = useState<AudioBuffer | MediaStream | null>(null);
-  const [audioInputMode, setAudioInputMode] = useState<'file' | 'microphone'>('file');
-  const [microphoneStream, setMicrophoneStream] = useState<MediaStream | null>(null);
-  const [hasMicrophonePermission, setHasMicrophonePermission] = useState<boolean | null>(null);
-  const [recordingState, setRecordingState] = useState<RecordingState>('idle');
-  const [webmUrl, setWebmUrl] = useState<string | null>(null);
+  const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
   const [volumeThreshold, setVolumeThreshold] = useState(0.01);
+  const [mouthMidThreshold, setMouthMidThreshold] = useState(0.02);
+  const [mouthOpenThreshold, setMouthOpenThreshold] = useState(0.05);
   const [debugGuides, setDebugGuides] = useState(false);
+  const [spriteAnalysis, setSpriteAnalysis] = useState<SpriteSheetAnalysis | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [selectedFrames, setSelectedFrames] = useState<ExpressionFrameSelection | null>(null);
   const [expressionPrompt, setExpressionPrompt] = useState<string>('');
   const [selectedPresetId, setSelectedPresetId] = useState<string>('happy');
   const [referenceImage, setReferenceImage] = useState<string | null>(null);
   const [status, setStatus] = useState<GenerationStatus>(GenerationStatus.IDLE);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState<string>('');
+  const [regenerateKey, setRegenerateKey] = useState<number>(0);
   
-  const recordingControlsRef = useRef<{
-    startRecording: () => void;
-    stopRecording: () => void;
-    getRecordedBlob: () => Blob | null;
-  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const spriteFileInputRef = useRef<HTMLInputElement>(null);
   const imageFileInputRef = useRef<HTMLInputElement>(null);
@@ -57,10 +55,29 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
     }
   }, [selectedPresetId]);
 
+  const createInitialSelection = (analysis?: SpriteSheetAnalysis | null): ExpressionFrameSelection => {
+    const eyesOpen = analysis?.recommendedEyesOpenFrame ?? 0;
+    const eyesClosed = analysis?.recommendedEyesClosedFrame ?? 0;
+    const mouthOpen = analysis?.recommendedMouthOpenFrame ?? 0;
+    const mouthClosed = analysis?.recommendedMouthClosedFrame ?? 0;
+    const mouthMid = mouthOpen;
+
+    return {
+      eyesOpenMouthOpen: eyesOpen,
+      eyesOpenMouthMid: mouthMid,
+      eyesOpenMouthClosed: eyesOpen,
+      eyesClosedMouthOpen: eyesClosed,
+      eyesClosedMouthMid: mouthMid,
+      eyesClosedMouthClosed: eyesClosed || mouthClosed,
+    };
+  };
+
   // Parse sprite sheet when it arrives
   useEffect(() => {
     if (!spriteSheetBase64) {
       setFrames([]);
+      setSpriteAnalysis(null);
+      setSelectedFrames(null);
       return;
     }
 
@@ -77,12 +94,14 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
           setFrameHeight(h);
         };
         img.src = spriteSheetBase64;
+
+        setSelectedFrames(createInitialSelection(null));
       } catch (err) {
         console.error("Error processing sprite sheet:", err);
       }
     };
     process();
-  }, [spriteSheetBase64]);
+  }, [spriteSheetBase64, apiKey]);
 
   // Handle reference image upload
   const handleReferenceImageUpload = useCallback(async (file: File) => {
@@ -107,82 +126,57 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
   // Handle audio file upload
   const handleAudioFileUpload = useCallback(async (file: File) => {
     try {
+      console.log('[FaceAnimationEditor] 音声ファイルアップロード', {
+        fileName: file.name,
+        fileSize: file.size,
+      });
       const arrayBuffer = await file.arrayBuffer();
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
       setAudioSource(audioBuffer);
+      setGeneratedVideoUrl(null); // 新しいファイルで動画をリセット
+      console.log('[FaceAnimationEditor] 音声ファイル読み込み完了', {
+        duration: audioBuffer.duration.toFixed(2) + 's',
+      });
     } catch (err) {
-      console.error('Failed to load audio file:', err);
+      console.error('[FaceAnimationEditor] 音声ファイル読み込みエラー:', err);
     }
   }, []);
 
-  // Handle microphone access
-  const handleMicrophoneAccess = useCallback(async () => {
+  // Handle video generation
+  const handleVideoGenerated = useCallback((videoUrl: string) => {
+    setGeneratedVideoUrl(videoUrl);
+  }, []);
+
+  const handleAnalyzeSpriteSheet = useCallback(async () => {
+    if (!apiKey || !spriteSheetBase64) {
+      setErrorMsg(language === 'ja' ? 'APIキーとスプライトを用意してください。' : 'Please set API key and upload a sprite sheet.');
+      return;
+    }
+    setIsAnalyzing(true);
+    setErrorMsg(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setMicrophoneStream(stream);
-      setAudioSource(stream);
-      setHasMicrophonePermission(true);
+      const analysis = await analyzeSpriteSheet(apiKey, spriteSheetBase64);
+      setSpriteAnalysis(analysis);
+      setSelectedFrames(createInitialSelection(analysis));
+      console.log('[FaceAnimationEditor] スプライトシート分析完了', analysis);
     } catch (err: any) {
-      console.error('Failed to access microphone:', err);
-      setHasMicrophonePermission(false);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        alert(t.microphoneNotAllowed);
-      }
+      console.error('[FaceAnimationEditor] スプライトシート分析エラー:', err);
+      setErrorMsg(err?.message || (language === 'ja' ? '分析に失敗しました。' : 'Failed to analyze sprite sheet.'));
+    } finally {
+      setIsAnalyzing(false);
     }
-  }, [t.microphoneNotAllowed]);
+  }, [apiKey, spriteSheetBase64, language]);
 
-  // Cleanup microphone stream
-  useEffect(() => {
-    return () => {
-      if (microphoneStream) {
-        microphoneStream.getTracks().forEach((track) => track.stop());
-      }
-    };
-  }, [microphoneStream]);
-
-  // Handle audio input mode change
-  useEffect(() => {
-    if (audioInputMode === 'file') {
-      if (microphoneStream) {
-        microphoneStream.getTracks().forEach((track) => track.stop());
-        setMicrophoneStream(null);
-      }
-      setAudioSource(null);
-    } else if (audioInputMode === 'microphone') {
-      handleMicrophoneAccess();
-    }
-  }, [audioInputMode, handleMicrophoneAccess]);
-
-  // Handle recording state change
-  const handleRecordingStateChange = useCallback((state: RecordingState) => {
-    setRecordingState(state);
-    if (state === 'idle' && recordingControlsRef.current) {
-      const blob = recordingControlsRef.current.getRecordedBlob();
-      if (blob) {
-        const url = URL.createObjectURL(blob);
-        setWebmUrl(url);
-      }
-    }
-  }, []);
-
-  // Handle recording controls ready
-  const handleRecordingControlsReady = useCallback((controls: {
-    startRecording: () => void;
-    stopRecording: () => void;
-    getRecordedBlob: () => Blob | null;
-  }) => {
-    recordingControlsRef.current = controls;
-  }, []);
-
-  // Start/stop recording
-  const handleStartRecording = useCallback(() => {
-    recordingControlsRef.current?.startRecording();
-  }, []);
-
-  const handleStopRecording = useCallback(() => {
-    recordingControlsRef.current?.stopRecording();
-  }, []);
+  const handleFrameSelect = useCallback(
+    (key: keyof ExpressionFrameSelection, frameIndex: number) => {
+      setSelectedFrames((prev) => ({
+        ...(prev || createInitialSelection(spriteAnalysis)),
+        [key]: frameIndex,
+      }));
+    },
+    [spriteAnalysis]
+  );
 
   // Handle expression sprite generation
   const handleGenerateExpressionSprite = useCallback(async () => {
@@ -358,11 +352,64 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
                   </svg>
                   {t.downloadPng}
                 </a>
+                <button
+                  onClick={handleAnalyzeSpriteSheet}
+                  disabled={isAnalyzing || !apiKey}
+                  className={`mt-3 w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border ${
+                    isAnalyzing || !apiKey
+                      ? 'bg-gray-200 text-gray-500 border-gray-300 cursor-not-allowed'
+                      : 'bg-blue-500 text-white border-blue-600 hover:bg-blue-600'
+                  }`}
+                >
+                  {isAnalyzing
+                    ? language === 'ja'
+                      ? '分析中...'
+                      : 'Analyzing...'
+                    : language === 'ja'
+                    ? 'Geminiで分析して自動割当'
+                    : 'Analyze with Gemini & auto-allocate'}
+                </button>
+                {spriteAnalysis && (
+                  <div className="mt-2 text-xs text-green-700 bg-green-50 border border-green-200 rounded-md px-3 py-2 w-full">
+                    {language === 'ja'
+                      ? `✓ 分析結果を適用: 目開=${spriteAnalysis.recommendedEyesOpenFrame}, 目閉=${spriteAnalysis.recommendedEyesClosedFrame}, 口開=${spriteAnalysis.recommendedMouthOpenFrame}, 口閉=${spriteAnalysis.recommendedMouthClosedFrame}`
+                      : `✓ Applied analysis: Eyes open=${spriteAnalysis.recommendedEyesOpenFrame}, Eyes closed=${spriteAnalysis.recommendedEyesClosedFrame}, Mouth open=${spriteAnalysis.recommendedMouthOpenFrame}, Mouth closed=${spriteAnalysis.recommendedMouthClosedFrame}`}
+                  </div>
+                )}
               </div>
               {/* Right: Face Animation Preview */}
               <div className="flex flex-col items-center">
                 {frames.length > 0 ? (
                   <>
+                    {isAnalyzing && (
+                      <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                        <p className="text-xs text-blue-700">
+                          {language === 'ja' ? '🔍 Gemini APIでスプライトシートを分析中...' : '🔍 Analyzing sprite sheet with Gemini API...'}
+                        </p>
+                      </div>
+                    )}
+                    {spriteAnalysis && (
+                      <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+                        <p className="text-xs text-green-700">
+                          {language === 'ja' 
+                            ? `✓ 分析完了: 目開=${spriteAnalysis.recommendedEyesOpenFrame}, 目閉=${spriteAnalysis.recommendedEyesClosedFrame}, 口開=${spriteAnalysis.recommendedMouthOpenFrame}, 口閉=${spriteAnalysis.recommendedMouthClosedFrame}`
+                            : `✓ Analysis complete: Eyes open=${spriteAnalysis.recommendedEyesOpenFrame}, Eyes closed=${spriteAnalysis.recommendedEyesClosedFrame}, Mouth open=${spriteAnalysis.recommendedMouthOpenFrame}, Mouth closed=${spriteAnalysis.recommendedMouthClosedFrame}`}
+                        </p>
+                      </div>
+                    )}
+
+                    {frames.length > 0 && (
+                      <div className="mb-4">
+                        <FaceFrameSelector
+                          frames={frames}
+                          analysis={spriteAnalysis}
+                          selectedFrames={selectedFrames || createInitialSelection(spriteAnalysis)}
+                          onFrameSelect={handleFrameSelect}
+                          language={language}
+                        />
+                      </div>
+                    )}
+                    
                     <FaceAnimator
                       frames={frames}
                       width={frameWidth}
@@ -370,59 +417,29 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
                       audioSource={audioSource}
                       debugGuides={debugGuides}
                       volumeThreshold={volumeThreshold}
-                      onRecordingStateChange={handleRecordingStateChange}
-                      onRecordingControlsReady={handleRecordingControlsReady}
+                      mouthMidThreshold={mouthMidThreshold}
+                      mouthOpenThreshold={mouthOpenThreshold}
+                      spriteAnalysis={spriteAnalysis}
+                      selectedFrames={selectedFrames}
+                      regenerateKey={regenerateKey}
+                      onVideoGenerated={handleVideoGenerated}
                     />
 
-                    {/* Recording Controls */}
-                    <div className="mt-4 w-full space-y-2">
-                      <h4 className="text-sm font-bold text-gray-700 mb-2">
-                        {language === 'ja' ? '録画コントロール' : 'Recording Controls'}
-                      </h4>
-                      {!audioSource && (
-                        <div className="mb-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-700">
-                          {language === 'ja' ? '⚠ 音声ファイルをアップロードするか、マイクを有効にしてください。' : '⚠ Please upload an audio file or enable microphone.'}
-                        </div>
-                      )}
-                      <div className="flex gap-2">
-                        {recordingState === 'idle' ? (
-                          <button
-                            onClick={handleStartRecording}
-                            disabled={!audioSource || frames.length === 0}
-                            className="flex-1 px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-sm font-semibold shadow-md hover:shadow-lg transition-all"
-                          >
-                            {t.recordingStart}
-                          </button>
-                        ) : recordingState === 'recording' ? (
-                          <button
-                            onClick={handleStopRecording}
-                            className="flex-1 px-4 py-2 bg-yellow-400 text-gray-900 rounded-lg hover:bg-yellow-300 text-sm font-semibold shadow-md hover:shadow-lg transition-all"
-                          >
-                            {t.recordingStop}
-                          </button>
-                        ) : (
-                          <button
-                            disabled
-                            className="flex-1 px-4 py-2 bg-gray-300 text-gray-600 rounded-lg cursor-wait text-sm font-semibold"
-                          >
-                            {t.recordingSaving}
-                          </button>
-                        )}
-                      </div>
-
-                      {webmUrl && (
+                    {/* Video Download */}
+                    {generatedVideoUrl && (
+                      <div className="mt-4 w-full">
                         <a
-                          href={webmUrl}
+                          href={generatedVideoUrl}
                           download="face_animation.webm"
-                          className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-yellow-400 text-gray-900 rounded-lg hover:bg-yellow-300 text-sm font-semibold"
+                          className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-yellow-400 text-gray-900 rounded-lg hover:bg-yellow-300 text-sm font-semibold shadow-md hover:shadow-lg transition-all"
                         >
                           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
                           </svg>
-                          {t.downloadWebm}
+                          {language === 'ja' ? '動画をダウンロード' : 'Download Video'}
                         </a>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="w-full h-64 bg-gray-100 rounded-lg flex items-center justify-center">
@@ -434,83 +451,29 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
               {/* Right: Controls */}
               <div className="flex flex-col gap-4">
                 <div>
-                  <h3 className="text-sm font-bold text-gray-700 mb-2">{t.audioInputMode}</h3>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => setAudioInputMode('file')}
-                      className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-                        audioInputMode === 'file'
-                          ? 'bg-yellow-400 text-gray-900'
-                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                      }`}
-                    >
-                      {t.audioFile}
-                    </button>
-                    <button
-                      onClick={() => setAudioInputMode('microphone')}
-                      className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-                        audioInputMode === 'microphone'
-                          ? 'bg-yellow-400 text-gray-900'
-                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                      }`}
-                    >
-                      {t.audioMicrophone}
-                    </button>
-                  </div>
-                </div>
-
-                {audioInputMode === 'file' && (
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">
-                      {t.uploadAudioFile}
-                    </label>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="audio/*"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) {
-                          handleAudioFileUpload(file);
-                        }
-                      }}
-                      className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-yellow-400 file:text-gray-900 hover:file:bg-yellow-300"
-                    />
-                    {audioSource && frames.length > 0 && (
-                      <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
-                        <p className="text-xs text-green-700 mb-2">
-                          {language === 'ja' ? '✓ 音声ファイルが読み込まれました。下の「録画開始」ボタンで録画を開始できます。' : '✓ Audio file loaded. You can start recording with the "Start Recording" button below.'}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {audioInputMode === 'microphone' && (
-                  <div>
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className="text-sm font-semibold text-gray-700">{t.microphonePermission}</span>
-                      {hasMicrophonePermission === false && (
-                        <span className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-semibold">
-                          {t.microphoneNotAllowed}
-                        </span>
-                      )}
-                      {hasMicrophonePermission === true && (
-                        <span className="px-2 py-1 bg-green-100 text-green-700 rounded text-xs font-semibold">
-                          ✓ Allowed
-                        </span>
-                      )}
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">
+                    {t.uploadAudioFile}
+                  </label>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="audio/*"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        handleAudioFileUpload(file);
+                      }
+                    }}
+                    className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-yellow-400 file:text-gray-900 hover:file:bg-yellow-300"
+                  />
+                  {audioSource && (
+                    <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
+                      <p className="text-xs text-green-700 mb-2">
+                        {language === 'ja' ? '✓ 音声ファイルが読み込まれました。動画は自動的に生成されます。' : '✓ Audio file loaded. Video will be generated automatically.'}
+                      </p>
                     </div>
-                    {!microphoneStream && (
-                      <button
-                        onClick={handleMicrophoneAccess}
-                        className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 text-sm font-semibold"
-                      >
-                        Request Microphone Access
-                      </button>
-                    )}
-                  </div>
-                )}
+                  )}
+                </div>
 
                 <div>
                   <label className="block text-sm font-semibold text-gray-700 mb-2">
@@ -527,6 +490,36 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
                   />
                 </div>
 
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">
+                    {language === 'ja' ? '口・中間しきい値' : 'Mouth Mid Threshold'}: {mouthMidThreshold.toFixed(3)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="0.2"
+                    step="0.001"
+                    value={mouthMidThreshold}
+                    onChange={(e) => setMouthMidThreshold(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-2">
+                    {language === 'ja' ? '口・大きく開くしきい値' : 'Mouth Open Threshold'}: {mouthOpenThreshold.toFixed(3)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="0.2"
+                    step="0.001"
+                    value={mouthOpenThreshold}
+                    onChange={(e) => setMouthOpenThreshold(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+
                 <div className="flex items-center gap-2">
                   <input
                     type="checkbox"
@@ -538,6 +531,28 @@ const FaceAnimationEditor: React.FC<FaceAnimationEditorProps> = ({ language }) =
                   <label htmlFor="debugGuides" className="text-sm font-semibold text-gray-700">
                     {t.debugGuides}
                   </label>
+                </div>
+
+                <div>
+                  <button
+                    onClick={() => {
+                      setGeneratedVideoUrl(null);
+                      setRegenerateKey((k) => k + 1);
+                    }}
+                    disabled={!audioSource}
+                    className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border ${
+                      !audioSource
+                        ? 'bg-gray-200 text-gray-400 border-gray-300 cursor-not-allowed'
+                        : 'bg-yellow-400 text-gray-900 border-yellow-500 hover:bg-yellow-300'
+                    }`}
+                  >
+                    {language === 'ja' ? 'しきい値を反映して再生成' : 'Regenerate with current thresholds'}
+                  </button>
+                  {!audioSource && (
+                    <p className="mt-1 text-xs text-gray-500">
+                      {language === 'ja' ? '音声を読み込むと再生成できます' : 'Load audio to regenerate video.'}
+                    </p>
+                  )}
                 </div>
 
                 {!MediaRecorder.isTypeSupported('video/webm') && (

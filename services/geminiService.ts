@@ -155,3 +155,136 @@ export const generateSprite = async (
     throw error;
   }
 };
+
+/**
+ * スプライトシートを分析して、各フレームの表情と顔パーツの座標を取得
+ */
+export interface FrameAnalysis {
+  frameIndex: number; // 0-15
+  eyesState: 'open' | 'closed';
+  mouthState: 'open' | 'closed';
+  emotion?: string; // 感情（happy, sad, surprised, neutral, etc.）
+  faceRect?: {
+    x: number; // 0-1 (normalized) - 顔全体の座標
+    y: number;
+    w: number;
+    h: number;
+  };
+  eyesRect?: {
+    x: number; // 0-1 (normalized)
+    y: number;
+    w: number;
+    h: number;
+  };
+  mouthRect?: {
+    x: number; // 0-1 (normalized)
+    y: number;
+    w: number;
+    h: number;
+  };
+}
+
+export interface SpriteSheetAnalysis {
+  frames: FrameAnalysis[];
+  recommendedEyesOpenFrame: number;
+  recommendedEyesClosedFrame: number;
+  recommendedMouthOpenFrame: number;
+  recommendedMouthClosedFrame: number;
+}
+
+export const analyzeSpriteSheet = async (
+  apiKey: string,
+  spriteSheetBase64: string
+): Promise<SpriteSheetAnalysis> => {
+  const ai = new GoogleGenAI({ apiKey });
+  
+  // Strip prefix if present for API consumption
+  const cleanBase64 = spriteSheetBase64.replace(/^data:image\/(png|jpeg|jpg|webp);base64,/, '');
+
+  const analysisPrompt = `
+この画像は4×4の16フレームのスプライトシートです。各フレームを分析して、以下の情報をJSON形式で返してください。
+
+【分析要件】
+1. 各フレーム（0-15、左→右、上→下の順）について：
+   - 目の状態（open/closed）
+   - 口の状態（open/closed）
+   - 感情（happy, sad, surprised, neutral, angry, etc.）
+   - 顔全体の位置とサイズ（正規化座標 0-1）- 顔の輪郭を含む領域
+   - 目の位置とサイズ（正規化座標 0-1）
+   - 口の位置とサイズ（正規化座標 0-1）
+
+2. 推奨フレーム：
+   - 最も目が開いているフレーム
+   - 最も目が閉じているフレーム
+   - 最も口が開いているフレーム
+   - 最も口が閉じているフレーム
+
+【出力形式】
+以下のJSON形式で返してください：
+{
+  "frames": [
+    {
+      "frameIndex": 0,
+      "eyesState": "open",
+      "mouthState": "closed",
+      "emotion": "happy",
+      "faceRect": {"x": 0.2, "y": 0.1, "w": 0.6, "h": 0.5},
+      "eyesRect": {"x": 0.25, "y": 0.2, "w": 0.5, "h": 0.15},
+      "mouthRect": {"x": 0.3, "y": 0.55, "w": 0.4, "h": 0.05}
+    },
+    ...
+  ],
+  "recommendedEyesOpenFrame": 0,
+  "recommendedEyesClosedFrame": 2,
+  "recommendedMouthOpenFrame": 5,
+  "recommendedMouthClosedFrame": 15
+}
+
+座標は正規化座標（0-1の範囲）で、画像の左上が(0,0)、右下が(1,1)です。
+各フレームは正方形で、4×4のグリッドに分割されています。
+faceRectは顔全体（輪郭を含む）の領域を指定してください。
+`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.0-flash-exp',
+      contents: {
+        parts: [
+          {
+            text: analysisPrompt
+          },
+          {
+            inlineData: {
+              mimeType: 'image/png',
+              data: cleanBase64
+            }
+          }
+        ]
+      },
+      config: {
+        responseMimeType: 'application/json'
+      }
+    });
+
+    // Extract JSON from response
+    if (response.candidates?.[0]?.content?.parts) {
+      for (const part of response.candidates[0].content.parts) {
+        if (part.text) {
+          try {
+            const analysis = JSON.parse(part.text) as SpriteSheetAnalysis;
+            console.log('[analyzeSpriteSheet] 分析完了', analysis);
+            return analysis;
+          } catch (parseError) {
+            console.error('[analyzeSpriteSheet] JSON解析エラー:', parseError, part.text);
+            throw new Error('Failed to parse analysis response as JSON');
+          }
+        }
+      }
+    }
+
+    throw new Error("No analysis data in the response.");
+  } catch (error) {
+    console.error("Gemini API Analysis Error:", error);
+    throw error;
+  }
+};

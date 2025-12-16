@@ -39,8 +39,17 @@ export interface FacePartImages {
   mouthClosed: string;
 }
 
-export type MouthState = 'open' | 'closed';
+export type MouthState = 'open' | 'mid' | 'closed';
 export type EyeState = 'open' | 'closed';
+
+export interface ExpressionFrameSelection {
+  eyesOpenMouthOpen: number;
+  eyesOpenMouthMid: number;
+  eyesOpenMouthClosed: number;
+  eyesClosedMouthOpen: number;
+  eyesClosedMouthMid: number;
+  eyesClosedMouthClosed: number;
+}
 
 export type RecordingState = 'idle' | 'recording' | 'saving';
 
